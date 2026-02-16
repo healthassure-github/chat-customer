@@ -1,0 +1,48 @@
+@import url("https://fonts.googleapis.com/css2?family=Outfit:wght@100..900&display=swap");
+@import "tailwindcss";
+@source "./**/*.{js,jsx,ts,tsx}";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: Outfit, sans-serif;
+  --font-sans--font-feature-settings: "cv11";
+
+  --text-tiny: 0.6875rem;
+  --text-tiny--line-height: 0.875rem;
+
+  --text-xxs: 0.625rem;
+  --text-xxs--line-height: 0.75rem;
+
+  --text-2xs: 0.5625rem;
+  --text-2xs--line-height: 0.75rem;
+
+  --text-3xs: 0.5rem;
+  --text-3xs--line-height: 0.625rem;
+
+  --text-4xs: 0.4375rem;
+  --text-4xs--line-height: 0.5625rem;
+}
+
+@layer base {
+  .ha-chat-customer-root {
+    font-family: var(--font-sans);
+  }
+
+  .ha-chat-customer-root * {
+    scrollbar-color: #9ca3af #f1f5f9;
+  }
+
+  .ha-chat-customer-root ::-webkit-scrollbar {
+    width: 2px;
+    height: 2px;
+  }
+
+  .ha-chat-customer-root ::-webkit-scrollbar-track {
+    background: #f1f5f9;
+  }
+
+  .ha-chat-customer-root ::-webkit-scrollbar-thumb {
+    background: #9ca3af;
+  }
+}
