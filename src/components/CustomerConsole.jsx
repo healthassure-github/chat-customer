@@ -208,6 +208,10 @@ export default function CustomerConsole({
   const [typingNotice, setTypingNotice] = useState("");
   const messagesListRef = useRef(null);
   const isAutoScrollRef = useRef(true);
+  const activeConversationIdRef = useRef("");
+  const liveUnsubscribersRef = useRef({ conversation: null, messages: null });
+  const closingConversationRef = useRef(false);
+  const recentlyClosedRef = useRef({ id: "", at: 0 });
   const [unreadCount, setUnreadCount] = useState(0);
   const lastMessageCountRef = useRef(0);
   const lastReadMessageIdRef = useRef(null);
@@ -230,6 +234,48 @@ export default function CustomerConsole({
     ? `Last read by ${otherRoleLabel} ${formatRelativeTime(otherLastReadAt)}`
     : `${otherRoleLabel} has not read yet.`;
   const typingChannelKey = conversationId;
+
+  const teardownLiveListeners = (resetActive = false) => {
+    const { conversation: unsubConversation, messages: unsubMessages } =
+      liveUnsubscribersRef.current;
+    liveUnsubscribersRef.current = { conversation: null, messages: null };
+    if (typeof unsubConversation === "function") {
+      try {
+        unsubConversation();
+      } catch {
+        // Ignore listener teardown errors.
+      }
+    }
+    if (typeof unsubMessages === "function") {
+      try {
+        unsubMessages();
+      } catch {
+        // Ignore listener teardown errors.
+      }
+    }
+    if (resetActive) {
+      activeConversationIdRef.current = "";
+    }
+  };
+
+  const isInternalAssertionError = (err) => {
+    const message = String(err?.message || err || "");
+    return (
+      message.includes("INTERNAL ASSERTION FAILED") ||
+      (message.includes("Unexpected state") && message.includes("FIRESTORE"))
+    );
+  };
+
+  const markRecentlyClosed = (id) => {
+    if (!id) return;
+    recentlyClosedRef.current = { id, at: Date.now() };
+  };
+
+  const isRecentlyClosed = (id) => {
+    if (!id) return false;
+    const snapshot = recentlyClosedRef.current;
+    return snapshot.id === id && Date.now() - snapshot.at < 15000;
+  };
 
   useEffect(() => {
     if (typeof onConversationIdChange !== "function") return;
@@ -266,16 +312,24 @@ export default function CustomerConsole({
     const currentAppointmentId = appointmentIdProp || "";
     if (prevAppointmentIdRef.current === currentAppointmentId) return;
     prevAppointmentIdRef.current = currentAppointmentId;
-    if (conversationIdProp) {
+    if (conversationIdProp && !isRecentlyClosed(conversationIdProp)) {
       setConversationId(conversationIdProp);
       return;
     }
     const stored = resolveStoredConversationId(customerMode, currentAppointmentId);
+    if (stored && isRecentlyClosed(stored)) {
+      setConversationId("");
+      return;
+    }
     setConversationId(stored || "");
   }, [customerMode, appointmentIdProp, conversationIdProp]);
 
   useEffect(() => {
-    if (conversationIdProp && conversationIdProp !== conversationId) {
+    if (
+      conversationIdProp &&
+      conversationIdProp !== conversationId &&
+      !isRecentlyClosed(conversationIdProp)
+    ) {
       setConversationId(conversationIdProp);
       return;
     }
@@ -284,7 +338,7 @@ export default function CustomerConsole({
         customerMode,
         appointmentIdProp || appointmentId
       );
-      if (stored && stored !== conversationId) {
+      if (stored && stored !== conversationId && !isRecentlyClosed(stored)) {
         setConversationId(stored);
       }
     }
@@ -323,6 +377,7 @@ export default function CustomerConsole({
     if (readReceiptTimerRef.current) {
       clearTimeout(readReceiptTimerRef.current);
     }
+    closingConversationRef.current = false;
     if (!conversationId || !messagesListRef.current) return;
     isAutoScrollRef.current = true;
     setUnreadCount(0);
@@ -375,6 +430,8 @@ export default function CustomerConsole({
   const scheduleReadReceipt = () => {
     if (!authUser || sessionRole !== "customer") return;
     if (isArchivedView) return;
+    if (closingConversationRef.current) return;
+    if (conversation?.status === "closed") return;
     if (!conversationId || !messages.length) return;
     if (!isAutoScrollRef.current) return;
     const lastMessageId = messages[messages.length - 1]?.id;
@@ -416,6 +473,12 @@ export default function CustomerConsole({
     };
     window.addEventListener("storage", handleStorage);
     return () => window.removeEventListener("storage", handleStorage);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      teardownLiveListeners(true);
+    };
   }, []);
 
   useEffect(() => {
@@ -482,6 +545,7 @@ export default function CustomerConsole({
 
   useEffect(() => {
     if (!authUser || sessionRole !== "customer" || !conversationId) {
+      teardownLiveListeners(true);
       setConversation(null);
       setMessages([]);
       if (!conversationId) {
@@ -490,33 +554,58 @@ export default function CustomerConsole({
       return undefined;
     }
 
+    teardownLiveListeners();
+    activeConversationIdRef.current = conversationId;
+    closingConversationRef.current = false;
+
+    const transitionToClosedState = async () => {
+      if (activeConversationIdRef.current !== conversationId) return;
+      if (closingConversationRef.current) return;
+      closingConversationRef.current = true;
+      markRecentlyClosed(conversationId);
+      teardownLiveListeners(true);
+      setConversation(null);
+      setMessages([]);
+      setTypingNotice("");
+      if (customerMode === "doctor" && appointmentId) {
+        await loadArchivedByAppointment(appointmentId);
+        return;
+      }
+      clearSupportConversation();
+    };
+
     const convRef = doc(db, "conversations", conversationId);
     const unsubConversation = onSnapshot(
       convRef,
       (snap) => {
+        if (activeConversationIdRef.current !== conversationId) return;
         if (!snap.exists()) {
-          setConversation(null);
-          setMessages([]);
-          if (customerMode === "doctor" && appointmentId) {
-            loadArchivedByAppointment(appointmentId);
-          } else {
-            resetArchivedView();
-          }
+          transitionToClosedState();
           return;
         }
+
+        const nextConversation = { id: snap.id, ...snap.data() };
+        if (nextConversation.status === "closed") {
+          setConversation(nextConversation);
+          transitionToClosedState();
+          return;
+        }
+
+        closingConversationRef.current = false;
         resetArchivedView();
-        setConversation({ id: snap.id, ...snap.data() });
+        setConversation(nextConversation);
       },
       (err) => {
+        if (activeConversationIdRef.current !== conversationId) return;
+        if (isInternalAssertionError(err)) {
+          transitionToClosedState();
+          return;
+        }
         if (err?.code === "permission-denied" || err?.message?.includes("permission")) {
-          setConversation(null);
-          setMessages([]);
-          if (customerMode === "doctor" && appointmentId) {
-            loadArchivedByAppointment(appointmentId);
-            return;
+          transitionToClosedState();
+          if (customerMode !== "doctor") {
+            setError("Session expired. Please start a new chat.");
           }
-          clearSupportConversation();
-          setError("Session expired. Please start a new chat.");
           return;
         }
         setError(err.message);
@@ -530,6 +619,8 @@ export default function CustomerConsole({
     const unsubMessages = onSnapshot(
       msgQuery,
       (snap) => {
+        if (activeConversationIdRef.current !== conversationId) return;
+        if (closingConversationRef.current) return;
         const items = snap.docs.map((docSnap) => ({
           id: docSnap.id,
           ...docSnap.data()
@@ -537,22 +628,42 @@ export default function CustomerConsole({
         setMessages(items);
       },
       (err) => {
+        if (activeConversationIdRef.current !== conversationId) return;
+        if (isInternalAssertionError(err)) {
+          transitionToClosedState();
+          return;
+        }
         if (err?.code === "permission-denied" || err?.message?.includes("permission")) {
-          if (customerMode === "doctor" && appointmentId) {
-            loadArchivedByAppointment(appointmentId);
-            return;
+          transitionToClosedState();
+          if (customerMode !== "doctor") {
+            setError("Session expired. Please start a new chat.");
           }
-          clearSupportConversation();
-          setError("Session expired. Please start a new chat.");
           return;
         }
         setError(err.message);
       }
     );
 
+    liveUnsubscribersRef.current = {
+      conversation: unsubConversation,
+      messages: unsubMessages
+    };
+
     return () => {
-      unsubConversation();
-      unsubMessages();
+      if (activeConversationIdRef.current === conversationId) {
+        teardownLiveListeners(true);
+      } else {
+        try {
+          unsubConversation();
+        } catch {
+          // Ignore listener teardown errors.
+        }
+        try {
+          unsubMessages();
+        } catch {
+          // Ignore listener teardown errors.
+        }
+      }
     };
   }, [authUser, conversationId, sessionRole, customerMode, appointmentId]);
 
@@ -588,6 +699,8 @@ export default function CustomerConsole({
   }
 
   const clearSupportConversation = () => {
+    teardownLiveListeners(true);
+    closingConversationRef.current = false;
     if (sessionStorageRef) {
       sessionStorageRef.removeItem(LOCAL_KEYS.customerConversationSupport);
       sessionStorageRef.removeItem(LOCAL_KEYS.customerConversationSupportLegacy);
@@ -720,6 +833,8 @@ export default function CustomerConsole({
 
   const setTypingStatus = async (isTyping) => {
     if (!typingChannelKey || !authUser || sessionRole !== "customer") return;
+    if (closingConversationRef.current) return;
+    if (conversation?.status === "closed") return;
     const typingRef = ref(rtdb, `typing/${typingChannelKey}/${authUser.uid}`);
     typingActiveRef.current = isTyping;
     await set(typingRef, {
@@ -738,6 +853,8 @@ export default function CustomerConsole({
 
   const handleTyping = () => {
     if (!typingChannelKey || !authUser || sessionRole !== "customer") return;
+    if (closingConversationRef.current) return;
+    if (conversation?.status === "closed") return;
     if (!typingActiveRef.current) {
       setTypingStatus(true);
     }
@@ -751,6 +868,8 @@ export default function CustomerConsole({
 
   const handleReset = async () => {
     setError(null);
+    teardownLiveListeners(true);
+    closingConversationRef.current = false;
     if (sessionStorageRef) {
       if (customerMode === "doctor" && appointmentId) {
         sessionStorageRef.removeItem(
